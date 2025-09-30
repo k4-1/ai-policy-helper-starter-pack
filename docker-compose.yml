@@ -5,7 +5,7 @@ services:
     ports:
       - "6333:6333"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/"]
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/6333' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
