@@ -5,11 +5,30 @@ from .settings import settings
 from .ingest import chunk_text, doc_hash
 from qdrant_client import QdrantClient, models as qm
 
-# ---- Simple local embedder (deterministic) ----
-def _tokenize(s: str) -> List[str]:
-    return [t.lower() for t in s.split()]
+# ---- Semantic embedder using sentence-transformers ----
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    SentenceTransformer = None
+
+class SemanticEmbedder:
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        """
+        Initialize semantic embedder with sentence-transformers model.
+        all-MiniLM-L6-v2: 384 dimensions, fast, good quality
+        """
+        self.model = SentenceTransformer(model_name)
+        self.dim = self.model.get_sentence_embedding_dimension()
+
+    def embed(self, text: str) -> np.ndarray:
+        # Generate semantic embedding
+        embedding = self.model.encode(text, convert_to_numpy=True)
+        return embedding.astype("float32")
 
 class LocalEmbedder:
+    """Fallback hash-based embedder for testing/offline scenarios"""
     def __init__(self, dim: int = 384):
         self.dim = dim
 
@@ -139,15 +158,30 @@ class Metrics:
 
 class RAGEngine:
     def __init__(self):
-        self.embedder = LocalEmbedder(dim=384)
+        # Embedder selection with graceful fallback
+        if settings.embedding_model == "semantic-384" and SENTENCE_TRANSFORMERS_AVAILABLE:
+            try:
+                self.embedder = SemanticEmbedder(model_name="all-MiniLM-L6-v2")
+                self.embedding_name = "semantic-384"
+            except Exception as e:
+                logging.warning(f"Failed to initialize SemanticEmbedder: {e}. Falling back to LocalEmbedder.")
+                self.embedder = LocalEmbedder(dim=384)
+                self.embedding_name = "local-384"
+        else:
+            # Use local embedder if semantic not available or not requested
+            self.embedder = LocalEmbedder(dim=384)
+            self.embedding_name = "local-384"
+            if settings.embedding_model == "semantic-384" and not SENTENCE_TRANSFORMERS_AVAILABLE:
+                logging.warning("Semantic embeddings requested but sentence-transformers not available. Using local embedder.")
+        
         # Vector store selection
         if settings.vector_store == "qdrant":
             try:
-                self.store = QdrantStore(collection=settings.collection_name, dim=384)
+                self.store = QdrantStore(collection=settings.collection_name, dim=self.embedder.dim)
             except Exception:
-                self.store = InMemoryStore(dim=384)
+                self.store = InMemoryStore(dim=self.embedder.dim)
         else:
-            self.store = InMemoryStore(dim=384)
+            self.store = InMemoryStore(dim=self.embedder.dim)
 
         # LLM selection
         if settings.llm_provider == "openai" and settings.openai_api_key:
@@ -206,15 +240,64 @@ class RAGEngine:
         return {
             "total_docs": len(self._doc_titles),
             "total_chunks": self._chunk_count,
-            "embedding_model": settings.embedding_model,
+            "embedding_model": self.embedding_name,
             "llm_model": self.llm_name,
             **m
         }
 
 # ---- Helpers ----
 def build_chunks_from_docs(docs: List[Dict], chunk_size: int, overlap: int) -> List[Dict]:
-    out = []
-    for d in docs:
-        for ch in chunk_text(d["text"], chunk_size, overlap):
-            out.append({"title": d["title"], "section": d["section"], "text": ch})
-    return out
+    """
+    Build chunks that preserve semantic boundaries and document structure.
+    Each section becomes its own chunk to maintain coherent context.
+    """
+    chunks = []
+    
+    for doc in docs:
+        section_text = doc["text"].strip()
+        
+        # If section is small enough, keep it as one chunk
+        if len(section_text.split()) <= chunk_size:
+            chunks.append({
+                "title": doc["title"],
+                "section": doc["section"],
+                "text": section_text
+            })
+        else:
+            # For large sections, split by paragraphs first to preserve meaning
+            paragraphs = [p.strip() for p in section_text.split('\n\n') if p.strip()]
+            
+            current_chunk = ""
+            current_word_count = 0
+            
+            for paragraph in paragraphs:
+                para_words = len(paragraph.split())
+                
+                # If adding this paragraph exceeds chunk size, finalize current chunk
+                if current_word_count + para_words > chunk_size and current_chunk:
+                    chunks.append({
+                        "title": doc["title"],
+                        "section": doc["section"],
+                        "text": current_chunk.strip()
+                    })
+                    # Start new chunk with overlap from previous
+                    overlap_text = " ".join(current_chunk.split()[-overlap:]) if overlap > 0 else ""
+                    current_chunk = overlap_text + ("\n\n" if overlap_text else "") + paragraph
+                    current_word_count = len(current_chunk.split())
+                else:
+                    # Add paragraph to current chunk
+                    if current_chunk:
+                        current_chunk += "\n\n" + paragraph
+                    else:
+                        current_chunk = paragraph
+                    current_word_count += para_words
+            
+            # Add final chunk if it has content
+            if current_chunk.strip():
+                chunks.append({
+                    "title": doc["title"],
+                    "section": doc["section"],
+                    "text": current_chunk.strip()
+                })
+    
+    return chunks
