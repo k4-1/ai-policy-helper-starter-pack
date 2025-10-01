@@ -1,4 +1,4 @@
-import time, os, math, json, hashlib
+import time, os, math, json, hashlib, uuid
 from typing import List, Dict, Tuple
 import numpy as np
 from .settings import settings
@@ -70,7 +70,9 @@ class QdrantStore:
     def upsert(self, vectors: List[np.ndarray], metadatas: List[Dict]):
         points = []
         for i, (v, m) in enumerate(zip(vectors, metadatas)):
-            points.append(qm.PointStruct(id=m.get("id") or m.get("hash") or i, vector=v.tolist(), payload=m))
+            # Generate UUID for Qdrant point ID
+            point_id = str(uuid.uuid4())
+            points.append(qm.PointStruct(id=point_id, vector=v.tolist(), payload=m))
         self.client.upsert(collection_name=self.collection, points=points)
 
     def search(self, query: np.ndarray, k: int = 4) -> List[Tuple[float, Dict]]:
@@ -172,8 +174,7 @@ class RAGEngine:
             text = ch["text"]
             h = doc_hash(text)
             meta = {
-                "id": h,
-                "hash": h,
+                "hash": h,  # Keep hash for deduplication but don't use as ID
                 "title": ch["title"],
                 "section": ch.get("section"),
                 "text": text,
