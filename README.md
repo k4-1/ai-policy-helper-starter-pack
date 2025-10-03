@@ -50,7 +50,7 @@ Validation    MMR Diversity      PDPA Redaction   Business Rules
 - **MMR Diversification**: Maximal Marginal Relevance for diverse, relevant results
 - **Relevance Filtering**: Configurable score thresholds to reduce noise
 
-### 3. Policy-Aware Response System
+### 3. Policy Aware Response System
 
 - **Business Logic Integration**: Return policies, warranty rules, edge cases
 - **Structured Analysis**: Product type, damage classification, timeframe validation
