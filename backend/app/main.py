@@ -70,6 +70,7 @@ def insert_feedback(fid: str, query: str, answer: str, helpful: bool, comment: s
     conn.close()
 
 # Startup handled via lifespan above
+#Error Helper
 
 def create_error_response(error_type: ErrorType, message: str, user_message: str, suggestions: List[str] = None) -> ErrorResponse:
     """Create a standardized error response"""
@@ -83,6 +84,7 @@ def create_error_response(error_type: ErrorType, message: str, user_message: str
         request_id=str(uuid.uuid4())
     )
 
+#Global Exception Handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler for unhandled errors"""
@@ -128,6 +130,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content=error_response.model_dump()
     )
 
+#Health API
 @app.get("/api/health")
 def health():
     # Check configuration errors
@@ -147,11 +150,13 @@ def health():
     
     return {"status": "healthy", "llm_provider": settings.llm_provider}
 
+#Metrics API
 @app.get("/api/metrics", response_model=MetricsResponse)
 def metrics():
     s = engine.stats()
     return MetricsResponse(**s)
 
+#Ingest API
 @app.post("/api/ingest", response_model=IngestResponse)
 def ingest():
     try:
@@ -196,6 +201,7 @@ def ingest():
             ).model_dump()
         )
 
+#Ask API (Stream)
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
@@ -346,6 +352,7 @@ def ask_stream(req: AskRequest):
     except Exception as e:
         raise e
 
+# Feedback API
 @app.post("/api/feedback", response_model=FeedbackResponse)
 def feedback(req: FeedbackRequest):
     try:
