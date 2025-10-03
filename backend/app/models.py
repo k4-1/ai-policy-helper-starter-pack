@@ -1,5 +1,25 @@
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from enum import Enum
+
+class ErrorType(str, Enum):
+    VALIDATION_ERROR = "validation_error"
+    AUTHENTICATION_ERROR = "authentication_error"
+    RATE_LIMIT_ERROR = "rate_limit_error"
+    SERVICE_UNAVAILABLE = "service_unavailable"
+    INTERNAL_ERROR = "internal_error"
+    NOT_FOUND = "not_found"
+    TIMEOUT_ERROR = "timeout_error"
+
+class ErrorDetail(BaseModel):
+    type: ErrorType
+    message: str
+    user_message: str
+    suggestions: Optional[List[str]] = None
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail
+    request_id: Optional[str] = None
 
 class IngestResponse(BaseModel):
     indexed_docs: int
@@ -18,11 +38,16 @@ class Chunk(BaseModel):
     section: str | None = None
     text: str
 
+class AggregatedChunk(BaseModel):
+    text: str
+    sources: List[Citation]
+    source_count: int
+
 class AskResponse(BaseModel):
     query: str
     answer: str
     citations: List[Citation]
-    chunks: List[Chunk]
+    chunks: List[AggregatedChunk]
     metrics: Dict[str, Any]
 
 class MetricsResponse(BaseModel):

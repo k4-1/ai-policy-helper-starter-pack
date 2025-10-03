@@ -1,6 +1,6 @@
 "use client";
 import React from "react";
-import { apiIngest, apiMetrics } from "../lib/api";
+import { apiIngest, apiMetrics, ApiException } from "../lib/api";
 
 export default function AdminPanel() {
   const [metrics, setMetrics] = React.useState<any>(null);
@@ -18,7 +18,69 @@ export default function AdminPanel() {
       setMetrics(m);
     } catch (err) {
       console.error("Error fetching metrics:", err);
-      setError(err instanceof Error ? err.message : "Failed to fetch metrics");
+      
+      if (err instanceof ApiException) {
+        let errorTitle = "Something went wrong";
+        let errorMessage = "An unexpected error occurred. Please try again or contact support.";
+        
+        // Use the user-friendly message from the backend if available
+        if (err.userMessage) {
+          errorMessage = err.userMessage;
+        }
+        
+        // Set title based on error type or status
+        if (err.errorType) {
+          switch (err.errorType) {
+            case 'authentication_error':
+              errorTitle = "Authentication Issue";
+              break;
+            case 'rate_limit_error':
+              errorTitle = "Too Many Requests";
+              break;
+            case 'timeout_error':
+              errorTitle = "Request Timeout";
+              break;
+            case 'connection_error':
+              errorTitle = "Connection Problem";
+              break;
+            case 'service_unavailable':
+              errorTitle = "Service Unavailable";
+              break;
+            case 'validation_error':
+              errorTitle = "Invalid Input";
+              break;
+            case 'not_found':
+              errorTitle = "No Results Found";
+              break;
+            default:
+              errorTitle = "Server Issue";
+          }
+        } else {
+          // Fallback to status-based handling if no error type
+          switch (err.status) {
+            case 0:
+              errorTitle = "Connection Problem";
+              break;
+            case 408:
+              errorTitle = "Request Timeout";
+              break;
+            case 500:
+              errorTitle = "Server Issue";
+              break;
+          }
+        }
+        
+        // Add suggestions if available
+        let fullMessage = `${errorTitle}: ${errorMessage}`;
+        if (err.suggestions && err.suggestions.length > 0) {
+          fullMessage += "\n\nSuggestions:\n" + err.suggestions.map(s => `• ${s}`).join('\n');
+        }
+        
+        setError(fullMessage);
+      } else {
+        console.error('Unexpected error in refresh:', err);
+        setError('Oops! Something went wrong while refreshing. Please try again.');
+      }
     } finally {
       setRefreshing(false);
     }
@@ -34,7 +96,69 @@ export default function AdminPanel() {
       await refresh();
     } catch (err) {
       console.error("Error during ingestion:", err);
-      setError(err instanceof Error ? err.message : "Failed to ingest documents");
+      
+      if (err instanceof ApiException) {
+        let errorTitle = "Ingestion Failed";
+        let errorMessage = "An unexpected error occurred during ingestion. Please try again or contact support.";
+        
+        // Use the user-friendly message from the backend if available
+        if (err.userMessage) {
+          errorMessage = err.userMessage;
+        }
+        
+        // Set title based on error type or status
+        if (err.errorType) {
+          switch (err.errorType) {
+            case 'authentication_error':
+              errorTitle = "Authentication Issue";
+              break;
+            case 'rate_limit_error':
+              errorTitle = "Too Many Requests";
+              break;
+            case 'timeout_error':
+              errorTitle = "Ingestion Timeout";
+              break;
+            case 'connection_error':
+              errorTitle = "Connection Problem";
+              break;
+            case 'service_unavailable':
+              errorTitle = "Service Unavailable";
+              break;
+            case 'validation_error':
+              errorTitle = "Invalid Documents";
+              break;
+            case 'not_found':
+              errorTitle = "No Documents Found";
+              break;
+            default:
+              errorTitle = "Server Issue";
+          }
+        } else {
+          // Fallback to status-based handling if no error type
+          switch (err.status) {
+            case 0:
+              errorTitle = "Connection Problem";
+              break;
+            case 408:
+              errorTitle = "Ingestion Timeout";
+              break;
+            case 500:
+              errorTitle = "Server Issue";
+              break;
+          }
+        }
+        
+        // Add suggestions if available
+        let fullMessage = `${errorTitle}: ${errorMessage}`;
+        if (err.suggestions && err.suggestions.length > 0) {
+          fullMessage += "\n\nSuggestions:\n" + err.suggestions.map(s => `• ${s}`).join('\n');
+        }
+        
+        setError(fullMessage);
+      } else {
+        console.error('Unexpected error in ingest:', err);
+        setError('Oops! Something went wrong during ingestion. Please try again.');
+      }
     } finally {
       setBusy(false);
     }

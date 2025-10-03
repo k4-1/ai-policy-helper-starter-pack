@@ -1,9 +1,14 @@
-import time, os, math, json, hashlib, uuid
-from typing import List, Dict, Tuple
+import time, os, math, json, hashlib, uuid, logging
+from typing import List, Dict, Tuple, Optional
 import numpy as np
 from .settings import settings
 from .ingest import chunk_text, doc_hash
 from qdrant_client import QdrantClient, models as qm
+from qdrant_client.http.exceptions import UnexpectedResponse
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---- Semantic embedder using sentence-transformers ----
 try:
@@ -72,39 +77,171 @@ class InMemoryStore:
 
 class QdrantStore:
     def __init__(self, collection: str, dim: int = 384):
-        self.client = QdrantClient(url="http://qdrant:6333", timeout=10.0)
         self.collection = collection
         self.dim = dim
-        self._ensure_collection()
+        self.client = None
+        self._connection_healthy = False
+        self._fallback_store = None
+        
+        # Initialize with robust error handling
+        self._initialize_client()
+
+    def _initialize_client(self):
+        """Initialize Qdrant client with comprehensive error handling and fallback."""
+        try:
+            self.client = QdrantClient(url="http://qdrant:6333", timeout=10.0)
+            # Test connection
+            self.client.get_collections()
+            self._connection_healthy = True
+            self._ensure_collection()
+            logger.info(f"Successfully connected to Qdrant for collection '{self.collection}'")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant: {e}")
+            self._connection_healthy = False
+            self._setup_fallback()
+
+    def _setup_fallback(self):
+        """Setup in-memory fallback store when Qdrant is unavailable."""
+        logger.warning("Setting up in-memory fallback store due to Qdrant connection failure")
+        self._fallback_store = InMemoryStore(dim=self.dim)
 
     def _ensure_collection(self):
+        """Ensure collection exists with proper error handling."""
+        if not self._connection_healthy or not self.client:
+            return
+            
         try:
             self.client.get_collection(self.collection)
-        except Exception:
-            self.client.recreate_collection(
-                collection_name=self.collection,
-                vectors_config=qm.VectorParams(size=self.dim, distance=qm.Distance.COSINE)
-            )
+            logger.info(f"Collection '{self.collection}' already exists")
+        except UnexpectedResponse as e:
+            if e.status_code == 404:
+                try:
+                    self.client.recreate_collection(
+                        collection_name=self.collection,
+                        vectors_config=qm.VectorParams(size=self.dim, distance=qm.Distance.COSINE)
+                    )
+                    logger.info(f"Created new collection '{self.collection}'")
+                except Exception as create_error:
+                    logger.error(f"Failed to create collection '{self.collection}': {create_error}")
+                    self._connection_healthy = False
+                    self._setup_fallback()
+            else:
+                logger.error(f"Unexpected error checking collection: {e}")
+                self._connection_healthy = False
+                self._setup_fallback()
+        except Exception as e:
+            logger.error(f"Error ensuring collection exists: {e}")
+            self._connection_healthy = False
+            self._setup_fallback()
+
+    def _health_check(self) -> bool:
+        """Perform health check and attempt reconnection if needed."""
+        if self._connection_healthy and self.client:
+            try:
+                self.client.get_collections()
+                return True
+            except Exception as e:
+                logger.warning(f"Qdrant health check failed: {e}")
+                self._connection_healthy = False
+                
+        # Attempt reconnection
+        if not self._connection_healthy:
+            logger.info("Attempting to reconnect to Qdrant...")
+            self._initialize_client()
+            
+        return self._connection_healthy
 
     def upsert(self, vectors: List[np.ndarray], metadatas: List[Dict]):
-        points = []
-        for i, (v, m) in enumerate(zip(vectors, metadatas)):
-            # Generate UUID for Qdrant point ID
-            point_id = str(uuid.uuid4())
-            points.append(qm.PointStruct(id=point_id, vector=v.tolist(), payload=m))
-        self.client.upsert(collection_name=self.collection, points=points)
+        """Upsert vectors with fallback handling."""
+        # Health check and potential reconnection
+        if not self._health_check():
+            if self._fallback_store:
+                logger.warning("Using fallback store for upsert operation")
+                self._fallback_store.upsert(vectors, metadatas)
+                return
+            else:
+                raise RuntimeError("Qdrant unavailable and no fallback store configured")
+
+        try:
+            points = []
+            for i, (v, m) in enumerate(zip(vectors, metadatas)):
+                # Use stable hash ID when available to prevent duplicate points
+                point_id = m.get("hash") or str(uuid.uuid4())
+                points.append(qm.PointStruct(id=point_id, vector=v.tolist(), payload=m))
+            
+            self.client.upsert(collection_name=self.collection, points=points)
+            logger.debug(f"Successfully upserted {len(points)} points to Qdrant")
+            
+        except Exception as e:
+            logger.error(f"Failed to upsert to Qdrant: {e}")
+            self._connection_healthy = False
+            
+            # Fallback to in-memory store
+            if self._fallback_store:
+                logger.warning("Falling back to in-memory store for upsert")
+                self._fallback_store.upsert(vectors, metadatas)
+            else:
+                self._setup_fallback()
+                self._fallback_store.upsert(vectors, metadatas)
 
     def search(self, query: np.ndarray, k: int = 4) -> List[Tuple[float, Dict]]:
-        res = self.client.search(
-            collection_name=self.collection,
-            query_vector=query.tolist(),
-            limit=k,
-            with_payload=True
-        )
-        out = []
-        for r in res:
-            out.append((float(r.score), dict(r.payload)))
-        return out
+        """Search vectors with fallback handling."""
+        # Health check and potential reconnection
+        if not self._health_check():
+            if self._fallback_store:
+                logger.warning("Using fallback store for search operation")
+                return self._fallback_store.search(query, k)
+            else:
+                logger.error("Qdrant unavailable and no fallback store configured")
+                return []
+
+        try:
+            res = self.client.search(
+                collection_name=self.collection,
+                query_vector=query.tolist(),
+                limit=k,
+                with_payload=True
+            )
+            
+            out = []
+            for r in res:
+                out.append((float(r.score), dict(r.payload)))
+            
+            logger.debug(f"Successfully retrieved {len(out)} results from Qdrant")
+            return out
+            
+        except Exception as e:
+            logger.error(f"Failed to search in Qdrant: {e}")
+            self._connection_healthy = False
+            
+            # Fallback to in-memory store
+            if self._fallback_store:
+                logger.warning("Falling back to in-memory store for search")
+                return self._fallback_store.search(query, k)
+            else:
+                logger.error("No fallback available for search operation")
+                return []
+
+    def get_status(self) -> Dict:
+        """Get detailed status information about the vector store."""
+        status = {
+            "type": "qdrant",
+            "healthy": self._connection_healthy,
+            "collection": self.collection,
+            "dimension": self.dim,
+            "fallback_active": self._fallback_store is not None
+        }
+        
+        if self._connection_healthy and self.client:
+            try:
+                collection_info = self.client.get_collection(self.collection)
+                status["points_count"] = collection_info.points_count
+                status["vectors_count"] = collection_info.vectors_count
+            except Exception as e:
+                logger.warning(f"Could not retrieve collection stats: {e}")
+                status["error"] = str(e)
+        
+        return status
 
 # ---- LLM provider ----
 class StubLLM:
@@ -163,8 +300,9 @@ class RAGEngine:
             try:
                 self.embedder = SemanticEmbedder(model_name="all-MiniLM-L6-v2")
                 self.embedding_name = "semantic-384"
+                logger.info("Successfully initialized SemanticEmbedder")
             except Exception as e:
-                logging.warning(f"Failed to initialize SemanticEmbedder: {e}. Falling back to LocalEmbedder.")
+                logger.warning(f"Failed to initialize SemanticEmbedder: {e}. Falling back to LocalEmbedder.")
                 self.embedder = LocalEmbedder(dim=384)
                 self.embedding_name = "local-384"
         else:
@@ -172,84 +310,197 @@ class RAGEngine:
             self.embedder = LocalEmbedder(dim=384)
             self.embedding_name = "local-384"
             if settings.embedding_model == "semantic-384" and not SENTENCE_TRANSFORMERS_AVAILABLE:
-                logging.warning("Semantic embeddings requested but sentence-transformers not available. Using local embedder.")
+                logger.warning("Semantic embeddings requested but sentence-transformers not available. Using local embedder.")
         
-        # Vector store selection
+        # Vector store selection with enhanced error handling
+        self.store = None
+        self.store_type = "unknown"
+        
         if settings.vector_store == "qdrant":
             try:
                 self.store = QdrantStore(collection=settings.collection_name, dim=self.embedder.dim)
-            except Exception:
+                self.store_type = "qdrant"
+                logger.info("Successfully initialized QdrantStore")
+            except Exception as e:
+                logger.error(f"Failed to initialize QdrantStore: {e}. Falling back to InMemoryStore.")
                 self.store = InMemoryStore(dim=self.embedder.dim)
+                self.store_type = "in_memory_fallback"
         else:
             self.store = InMemoryStore(dim=self.embedder.dim)
+            self.store_type = "in_memory"
+            logger.info("Using InMemoryStore as configured")
 
-        # LLM selection
+        # LLM selection with enhanced error handling
         if settings.llm_provider == "openai" and settings.openai_api_key:
             try:
                 self.llm = OpenAILLM(api_key=settings.openai_api_key)
                 self.llm_name = "openai:gpt-4o-mini"
-            except Exception:
+                logger.info("Successfully initialized OpenAI LLM")
+            except Exception as e:
+                logger.warning(f"Failed to initialize OpenAI LLM: {e}. Falling back to StubLLM.")
                 self.llm = StubLLM()
                 self.llm_name = "stub"
         else:
             self.llm = StubLLM()
             self.llm_name = "stub"
+            if settings.llm_provider == "openai":
+                logger.warning("OpenAI LLM requested but API key not available. Using StubLLM.")
 
         self.metrics = Metrics()
         self._doc_titles = set()
         self._chunk_count = 0
 
     def ingest_chunks(self, chunks: List[Dict]) -> Tuple[int, int]:
+        """Ingest chunks with comprehensive error handling and logging."""
+        if not chunks:
+            logger.warning("No chunks provided for ingestion")
+            return (0, 0)
+            
+        doc_titles_before = len(self._doc_titles)
         vectors = []
         metas = []
-        doc_titles_before = set(self._doc_titles)
-
+        
+        successful_chunks = 0
+        failed_chunks = 0
+        
         for ch in chunks:
-            text = ch["text"]
-            h = doc_hash(text)
-            meta = {
-                "hash": h,  # Keep hash for deduplication but don't use as ID
-                "title": ch["title"],
-                "section": ch.get("section"),
-                "text": text,
-            }
-            v = self.embedder.embed(text)
-            vectors.append(v)
-            metas.append(meta)
-            self._doc_titles.add(ch["title"])
-            self._chunk_count += 1
+            try:
+                text = ch["text"]
+                if not text or not text.strip():
+                    logger.warning(f"Empty text in chunk from {ch.get('title', 'unknown')}")
+                    failed_chunks += 1
+                    continue
+                    
+                h = doc_hash(text)
+                meta = {
+                    "hash": h,  # Keep hash for deduplication but don't use as ID
+                    "title": ch["title"],
+                    "section": ch.get("section"),
+                    "text": text,
+                }
+                
+                # Embed text with error handling
+                try:
+                    v = self.embedder.embed(text)
+                    vectors.append(v)
+                    metas.append(meta)
+                    self._doc_titles.add(ch["title"])
+                    self._chunk_count += 1
+                    successful_chunks += 1
+                except Exception as e:
+                    logger.error(f"Failed to embed chunk from {ch.get('title', 'unknown')}: {e}")
+                    failed_chunks += 1
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"Error processing chunk: {e}")
+                failed_chunks += 1
+                continue
 
-        self.store.upsert(vectors, metas)
-        return (len(self._doc_titles) - len(doc_titles_before), len(metas))
+        if not vectors:
+            logger.error("No valid vectors generated from chunks")
+            return (0, 0)
+
+        # Upsert vectors with error handling
+        try:
+            self.store.upsert(vectors, metas)
+            logger.info(f"Successfully ingested {successful_chunks} chunks, {failed_chunks} failed")
+        except Exception as e:
+            logger.error(f"Failed to upsert vectors to store: {e}")
+            raise RuntimeError(f"Vector store upsert failed: {e}")
+
+        return (len(self._doc_titles) - doc_titles_before, successful_chunks)
 
     def retrieve(self, query: str, k: int = 4) -> List[Dict]:
-        t0 = time.time()
-        qv = self.embedder.embed(query)
-        results = self.store.search(qv, k=k)
-        self.metrics.add_retrieval((time.time()-t0)*1000.0)
-        return [meta for score, meta in results]
+        """Retrieve relevant chunks with error handling and logging.
+        Returns metadata dicts with optional 'score' field preserved.
+        """
+        if not query or not query.strip():
+            logger.warning("Empty query provided for retrieval")
+            return []
+            
+        try:
+            t0 = time.time()
+            qv = self.embedder.embed(query)
+            # Fetch more than k to allow deduplication while preserving top-k unique
+            raw_results = self.store.search(qv, k=k*3)
+            retrieval_time = (time.time() - t0) * 1000.0
+            
+            self.metrics.add_retrieval(retrieval_time)
+            # Deduplicate by content hash or text
+            seen_keys = set()
+            deduped = []
+            for score, meta in raw_results:
+                key = meta.get("hash") or meta.get("text")
+                if not key:
+                    # If neither hash nor text, include as-is
+                    key = str(meta)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                meta = dict(meta)
+                meta["score"] = score
+                deduped.append(meta)
+                if len(deduped) >= k:
+                    break
+            retrieved_results = deduped
+            logger.debug(f"Retrieved {len(retrieved_results)} results in {retrieval_time:.2f}ms")
+            
+            return retrieved_results
+            
+        except Exception as e:
+            logger.error(f"Error during retrieval: {e}")
+            # Return empty results rather than crashing
+            return []
 
     def generate(self, query: str, contexts: List[Dict]) -> str:
-        t0 = time.time()
-        answer = self.llm.generate(query, contexts)
-        self.metrics.add_generation((time.time()-t0)*1000.0)
-        return answer
+        """Generate answer with error handling and logging."""
+        if not query or not query.strip():
+            logger.warning("Empty query provided for generation")
+            return "I need a question to provide an answer."
+            
+        try:
+            t0 = time.time()
+            answer = self.llm.generate(query, contexts)
+            generation_time = (time.time() - t0) * 1000.0
+            
+            self.metrics.add_generation(generation_time)
+            logger.debug(f"Generated answer in {generation_time:.2f}ms")
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error during answer generation: {e}")
+            raise
 
     def stats(self) -> Dict:
+        """Get comprehensive system statistics."""
         m = self.metrics.summary()
-        return {
+        stats = {
             "total_docs": len(self._doc_titles),
             "total_chunks": self._chunk_count,
             "embedding_model": self.embedding_name,
             "llm_model": self.llm_name,
+            "store_type": self.store_type,
             **m
         }
+        
+        # Add vector store specific stats if available
+        if hasattr(self.store, 'get_status'):
+            try:
+                store_status = self.store.get_status()
+                stats["store_status"] = store_status
+            except Exception as e:
+                logger.warning(f"Could not retrieve store status: {e}")
+                stats["store_status"] = {"error": str(e)}
+        
+        return stats
 
 # ---- Helpers ----
 def build_chunks_from_docs(docs: List[Dict], chunk_size: int, overlap: int) -> List[Dict]:
     """
-    Build chunks that preserve semantic boundaries and document structure.
-    Each section becomes its own chunk to maintain coherent context.
+    Build chunks with improved semantic-aware chunking strategy.
+    Preserves document structure while ensuring optimal chunk sizes for retrieval.
     """
     chunks = []
     
@@ -264,40 +515,239 @@ def build_chunks_from_docs(docs: List[Dict], chunk_size: int, overlap: int) -> L
                 "text": section_text
             })
         else:
-            # For large sections, split by paragraphs first to preserve meaning
-            paragraphs = [p.strip() for p in section_text.split('\n\n') if p.strip()]
+            # Enhanced chunking strategy with multiple splitting approaches
+            chunks_from_section = _smart_chunk_section(
+                section_text, 
+                doc["title"], 
+                doc["section"], 
+                chunk_size, 
+                overlap
+            )
+            chunks.extend(chunks_from_section)
+    
+    return chunks
+
+
+def _smart_chunk_section(text: str, title: str, section: str, chunk_size: int, overlap: int) -> List[Dict]:
+    """
+    Smart chunking that tries multiple strategies to preserve semantic meaning.
+    """
+    chunks = []
+    
+    # Strategy 1: Try to split by semantic boundaries (sentences, then paragraphs)
+    sentences = _split_into_sentences(text)
+    
+    if len(sentences) <= 1:
+        # Fallback to paragraph splitting if no sentence boundaries
+        return _chunk_by_paragraphs(text, title, section, chunk_size, overlap)
+    
+    current_chunk = ""
+    current_word_count = 0
+    
+    for sentence in sentences:
+        sentence_words = len(sentence.split())
+        
+        # If single sentence is too large, split it further
+        if sentence_words > chunk_size:
+            # Finalize current chunk if it has content
+            if current_chunk.strip():
+                chunks.append({
+                    "title": title,
+                    "section": section,
+                    "text": current_chunk.strip()
+                })
+            
+            # Split large sentence by clauses or phrases
+            large_sentence_chunks = _split_large_sentence(sentence, title, section, chunk_size, overlap)
+            chunks.extend(large_sentence_chunks)
             
             current_chunk = ""
             current_word_count = 0
+            continue
+        
+        # Check if adding this sentence exceeds chunk size
+        if current_word_count + sentence_words > chunk_size and current_chunk:
+            chunks.append({
+                "title": title,
+                "section": section,
+                "text": current_chunk.strip()
+            })
             
-            for paragraph in paragraphs:
-                para_words = len(paragraph.split())
-                
-                # If adding this paragraph exceeds chunk size, finalize current chunk
-                if current_word_count + para_words > chunk_size and current_chunk:
-                    chunks.append({
-                        "title": doc["title"],
-                        "section": doc["section"],
-                        "text": current_chunk.strip()
-                    })
-                    # Start new chunk with overlap from previous
-                    overlap_text = " ".join(current_chunk.split()[-overlap:]) if overlap > 0 else ""
-                    current_chunk = overlap_text + ("\n\n" if overlap_text else "") + paragraph
-                    current_word_count = len(current_chunk.split())
-                else:
-                    # Add paragraph to current chunk
-                    if current_chunk:
-                        current_chunk += "\n\n" + paragraph
-                    else:
-                        current_chunk = paragraph
-                    current_word_count += para_words
-            
-            # Add final chunk if it has content
-            if current_chunk.strip():
-                chunks.append({
-                    "title": doc["title"],
-                    "section": doc["section"],
-                    "text": current_chunk.strip()
-                })
+            # Start new chunk with overlap
+            overlap_text = _get_overlap_text(current_chunk, overlap)
+            current_chunk = overlap_text + (" " if overlap_text else "") + sentence
+            current_word_count = len(current_chunk.split())
+        else:
+            # Add sentence to current chunk
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+            current_word_count += sentence_words
+    
+    # Add final chunk if it has content
+    if current_chunk.strip():
+        chunks.append({
+            "title": title,
+            "section": section,
+            "text": current_chunk.strip()
+        })
     
     return chunks
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """
+    Split text into sentences using multiple delimiters and heuristics.
+    """
+    import re
+    
+    # Enhanced sentence splitting with better handling of abbreviations and edge cases
+    sentence_endings = r'[.!?]+(?:\s+|$)'
+    
+    # Split by sentence endings but be careful with abbreviations
+    potential_sentences = re.split(sentence_endings, text)
+    
+    sentences = []
+    for i, sentence in enumerate(potential_sentences):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # Add back the punctuation (except for the last one)
+        if i < len(potential_sentences) - 1:
+            # Look for the original ending in the text
+            next_pos = text.find(sentence) + len(sentence)
+            if next_pos < len(text):
+                ending_match = re.match(r'[.!?]+', text[next_pos:])
+                if ending_match:
+                    sentence += ending_match.group()
+        
+        sentences.append(sentence)
+    
+    return [s for s in sentences if s.strip()]
+
+
+def _chunk_by_paragraphs(text: str, title: str, section: str, chunk_size: int, overlap: int) -> List[Dict]:
+    """
+    Fallback chunking strategy using paragraph boundaries.
+    """
+    chunks = []
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    
+    current_chunk = ""
+    current_word_count = 0
+    
+    for paragraph in paragraphs:
+        para_words = len(paragraph.split())
+        
+        # If single paragraph is too large, split it by sentences
+        if para_words > chunk_size:
+            if current_chunk.strip():
+                chunks.append({
+                    "title": title,
+                    "section": section,
+                    "text": current_chunk.strip()
+                })
+                current_chunk = ""
+                current_word_count = 0
+            
+            # Split large paragraph
+            para_chunks = _smart_chunk_section(paragraph, title, section, chunk_size, overlap)
+            chunks.extend(para_chunks)
+            continue
+        
+        # Check if adding this paragraph exceeds chunk size
+        if current_word_count + para_words > chunk_size and current_chunk:
+            chunks.append({
+                "title": title,
+                "section": section,
+                "text": current_chunk.strip()
+            })
+            
+            # Start new chunk with overlap
+            overlap_text = _get_overlap_text(current_chunk, overlap)
+            current_chunk = overlap_text + ("\n\n" if overlap_text else "") + paragraph
+            current_word_count = len(current_chunk.split())
+        else:
+            # Add paragraph to current chunk
+            if current_chunk:
+                current_chunk += "\n\n" + paragraph
+            else:
+                current_chunk = paragraph
+            current_word_count += para_words
+    
+    # Add final chunk if it has content
+    if current_chunk.strip():
+        chunks.append({
+            "title": title,
+            "section": section,
+            "text": current_chunk.strip()
+        })
+    
+    return chunks
+
+
+def _split_large_sentence(sentence: str, title: str, section: str, chunk_size: int, overlap: int) -> List[Dict]:
+    """
+    Split a sentence that's too large by finding natural break points.
+    """
+    chunks = []
+    
+    # Try to split by commas, semicolons, or other natural breaks
+    import re
+    break_points = re.split(r'([,;:](?:\s+))', sentence)
+    
+    current_chunk = ""
+    current_word_count = 0
+    
+    for i, part in enumerate(break_points):
+        part_words = len(part.split())
+        
+        if current_word_count + part_words > chunk_size and current_chunk:
+            chunks.append({
+                "title": title,
+                "section": section,
+                "text": current_chunk.strip()
+            })
+            
+            overlap_text = _get_overlap_text(current_chunk, overlap)
+            current_chunk = overlap_text + (" " if overlap_text else "") + part
+            current_word_count = len(current_chunk.split())
+        else:
+            current_chunk += part
+            current_word_count += part_words
+    
+    # Add final chunk
+    if current_chunk.strip():
+        chunks.append({
+            "title": title,
+            "section": section,
+            "text": current_chunk.strip()
+        })
+    
+    return chunks
+
+
+def _get_overlap_text(text: str, overlap: int) -> str:
+    """
+    Get overlap text from the end of the current chunk, trying to preserve sentence boundaries.
+    """
+    if overlap <= 0:
+        return ""
+    
+    words = text.split()
+    if len(words) <= overlap:
+        return text
+    
+    # Get the last 'overlap' words
+    overlap_words = words[-overlap:]
+    overlap_text = " ".join(overlap_words)
+    
+    # Try to start from a sentence boundary if possible
+    sentences = _split_into_sentences(overlap_text)
+    if len(sentences) > 1:
+        # Use the last complete sentence(s) that fit within overlap
+        return sentences[-1]
+    
+    return overlap_text

@@ -7,16 +7,49 @@ def _read_text_file(path: str) -> str:
         return f.read()
 
 def _md_sections(text: str) -> List[Tuple[str, str]]:
-    # Very simple section splitter by Markdown headings
-    parts = re.split(r"\n(?=#+\s)", text)
+    """
+    Improved section splitter that handles nested headers and malformed markdown.
+    Returns sections with hierarchical titles and proper content extraction.
+    """
+    if not text.strip():
+        return [("Body", text)]
+    
+    # Split by any markdown header (1-6 levels)
+    parts = re.split(r"\n(?=#{1,6}\s)", text)
     out = []
+    
     for p in parts:
         p = p.strip()
         if not p:
             continue
+            
         lines = p.splitlines()
-        title = lines[0].lstrip("# ").strip() if lines and lines[0].startswith("#") else "Body"
-        out.append((title, p))
+        first_line = lines[0] if lines else ""
+        
+        # Extract header level and title
+        header_match = re.match(r"^(#{1,6})\s+(.+)", first_line)
+        if header_match:
+            level = len(header_match.group(1))
+            title = header_match.group(2).strip()
+            # Create hierarchical title with level indicator
+            title = f"{'  ' * (level - 1)}{title}"
+        else:
+            # Handle content without proper headers
+            title = "Body"
+            
+        # Extract content (remove the header line if it exists)
+        if header_match and len(lines) > 1:
+            content = "\n".join(lines[1:]).strip()
+        else:
+            content = p
+            
+        # Only add non-empty sections
+        if content.strip():
+            out.append((title, content))
+        elif header_match:
+            # Keep headers even if they have no content (for structure)
+            out.append((title, f"# {header_match.group(2)}"))
+    
     return out or [("Body", text)]
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
