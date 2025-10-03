@@ -1,4 +1,4 @@
-import time, os, math, json, hashlib, uuid, logging
+import time, os, math, json, hashlib, uuid, logging, re
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 from .settings import settings
@@ -165,8 +165,18 @@ class QdrantStore:
         try:
             points = []
             for i, (v, m) in enumerate(zip(vectors, metadatas)):
-                # Use stable hash ID when available to prevent duplicate points
-                point_id = m.get("hash") or str(uuid.uuid4())
+                # Use a valid UUID string as point ID; if a stable hex hash exists, map it to a UUID
+                h = m.get("hash")
+                if h:
+                    # Convert hex digest to UUID format deterministically
+                    try:
+                        # Use the first 32 hex chars to form a UUID
+                        hex32 = (h.replace("-", "") + ("0" * 32))[:32]
+                        point_id = str(uuid.UUID(hex=hex32))
+                    except Exception:
+                        point_id = str(uuid.uuid4())
+                else:
+                    point_id = str(uuid.uuid4())
                 points.append(qm.PointStruct(id=point_id, vector=v.tolist(), payload=m))
             
             self.client.upsert(collection_name=self.collection, points=points)
@@ -349,6 +359,10 @@ class RAGEngine:
         self.metrics = Metrics()
         self._doc_titles = set()
         self._chunk_count = 0
+        self._retrieval_cache = {}
+        self._generation_cache = {}
+        self._retrieval_order = []
+        self._generation_order = []
 
     def ingest_chunks(self, chunks: List[Dict]) -> Tuple[int, int]:
         """Ingest chunks with comprehensive error handling and logging."""
@@ -411,6 +425,72 @@ class RAGEngine:
 
         return (len(self._doc_titles) - doc_titles_before, successful_chunks)
 
+    def _cache_get(self, cache: dict, order: list, key: str, ttl: int):
+        v = cache.get(key)
+        if not v:
+            return None
+        if time.time() - v["ts"] > ttl:
+            try:
+                del cache[key]
+                order.remove(key)
+            except Exception:
+                pass
+            return None
+        try:
+            order.remove(key)
+        except ValueError:
+            pass
+        order.append(key)
+        return v["val"]
+
+    def _cache_put(self, cache: dict, order: list, key: str, val, max_size: int):
+        cache[key] = {"val": val, "ts": time.time()}
+        try:
+            order.remove(key)
+        except ValueError:
+            pass
+        order.append(key)
+        while len(order) > max_size:
+            evict = order.pop(0)
+            try:
+                del cache[evict]
+            except KeyError:
+                pass
+
+    def _mmr(self, candidates: List[Dict], lambda_: float, top_k: int) -> List[Dict]:
+        if not candidates:
+            return []
+        sims = np.array([max(0.0, min(1.0, float(c.get("score", 0.0)))) for c in candidates])
+        token_sets = []
+        for c in candidates:
+            toks = set(str(c.get("text", "")).lower().split())
+            token_sets.append(toks)
+        selected = []
+        remaining = list(range(len(candidates)))
+        while len(selected) < top_k and remaining:
+            if not selected:
+                best_local = int(np.argmax(sims[remaining]))
+                sel = remaining.pop(best_local)
+                selected.append(sel)
+                continue
+            max_div_scores = []
+            for idx in remaining:
+                candidate_tokens = token_sets[idx]
+                jaccards = []
+                for s in selected:
+                    inter = len(candidate_tokens & token_sets[s])
+                    union = len(candidate_tokens | token_sets[s]) or 1
+                    jaccards.append(inter / union)
+                diversity = 1.0 - (max(jaccards) if jaccards else 0.0)
+                max_div_scores.append(diversity)
+            max_div_scores = np.array(max_div_scores)
+            relevance = sims[remaining]
+            mmr_scores = lambda_ * relevance - (1 - lambda_) * max_div_scores
+            pick_local = int(np.argmax(mmr_scores))
+            sel = remaining.pop(pick_local)
+            selected.append(sel)
+        return [candidates[i] for i in selected]
+
     def retrieve(self, query: str, k: int = 4) -> List[Dict]:
         """Retrieve relevant chunks with error handling and logging.
         Returns metadata dicts with optional 'score' field preserved.
@@ -421,31 +501,32 @@ class RAGEngine:
             
         try:
             t0 = time.time()
+            cache_key = f"{self.embedding_name}|{self.store_type}|{k}|{query.strip()}"
+            if settings.cache_enabled:
+                cached = self._cache_get(self._retrieval_cache, self._retrieval_order, cache_key, settings.cache_ttl_seconds)
+                if cached is not None:
+                    return cached
             qv = self.embedder.embed(query)
-            # Fetch more than k to allow deduplication while preserving top-k unique
-            raw_results = self.store.search(qv, k=k*3)
+            raw_results = self.store.search(qv, k=max(k*3, settings.mmr_candidates))
             retrieval_time = (time.time() - t0) * 1000.0
             
             self.metrics.add_retrieval(retrieval_time)
-            # Deduplicate by content hash or text
+            candidates = []
             seen_keys = set()
-            deduped = []
             for score, meta in raw_results:
-                key = meta.get("hash") or meta.get("text")
-                if not key:
-                    # If neither hash nor text, include as-is
-                    key = str(meta)
+                key = meta.get("hash") or meta.get("text") or str(meta)
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                meta = dict(meta)
-                meta["score"] = score
-                deduped.append(meta)
-                if len(deduped) >= k:
-                    break
-            retrieved_results = deduped
+                m = dict(meta)
+                m["score"] = float(score)
+                candidates.append(m)
+            lambda_ = settings.mmr_lambda
+            ranked = self._mmr(candidates, lambda_=lambda_, top_k=k)
+            retrieved_results = ranked
             logger.debug(f"Retrieved {len(retrieved_results)} results in {retrieval_time:.2f}ms")
-            
+            if settings.cache_enabled:
+                self._cache_put(self._retrieval_cache, self._retrieval_order, cache_key, retrieved_results, settings.retrieval_cache_size)
             return retrieved_results
             
         except Exception as e:
@@ -458,20 +539,41 @@ class RAGEngine:
         if not query or not query.strip():
             logger.warning("Empty query provided for generation")
             return "I need a question to provide an answer."
-            
         try:
             t0 = time.time()
+            cache_key = None
+            if settings.cache_enabled:
+                ids = [c.get("hash") or str(c.get("text",""))[:64] for c in contexts]
+                cache_key = f"gen|{self.llm_name}|{query.strip()}|{'|'.join(ids)}"
+                cached = self._cache_get(self._generation_cache, self._generation_order, cache_key, settings.cache_ttl_seconds)
+                if cached is not None:
+                    return cached
             answer = self.llm.generate(query, contexts)
+            if settings.pdpa_redaction_enabled:
+                answer = self._redact_sensitive(answer)
             generation_time = (time.time() - t0) * 1000.0
-            
             self.metrics.add_generation(generation_time)
             logger.debug(f"Generated answer in {generation_time:.2f}ms")
-            
+            if settings.cache_enabled and cache_key:
+                self._cache_put(self._generation_cache, self._generation_order, cache_key, answer, settings.generation_cache_size)
             return answer
-            
         except Exception as e:
             logger.error(f"Error during answer generation: {e}")
             raise
+
+    def _redact_sensitive(self, text: str) -> str:
+        patterns = [
+            (r"\b\d{13,16}\b", "[REDACTED_CARD]"),
+            (r"\b\+?\d{7,15}\b", "[REDACTED_PHONE]"),
+            (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]")
+        ]
+        out = text
+        for pat, repl in patterns:
+            try:
+                out = re.sub(pat, repl, out)
+            except Exception:
+                pass
+        return out
 
     def stats(self) -> Dict:
         """Get comprehensive system statistics."""

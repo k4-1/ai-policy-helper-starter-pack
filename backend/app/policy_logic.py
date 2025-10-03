@@ -178,19 +178,22 @@ class PolicyInterpreter:
             analysis = self.analyze_return_query(query, contexts)
             
             # Create enhanced response
+            answer = self._create_enhanced_answer(analysis, base_answer)
+            answer = self._apply_enforcement(answer)
             enhanced_response = {
-                "answer": self._create_enhanced_answer(analysis, base_answer),
+                "answer": answer,
                 "policy_analysis": analysis,
                 "confidence": analysis["confidence"],
-                "requires_human_review": analysis["confidence"] < 0.7 or analysis["recommendation"]["status"] == "unclear",
+                "requires_human_review": self._requires_review(analysis, answer),
                 "is_policy_query": True
             }
             
             return enhanced_response
         
         # For non-return queries, return base response
+        processed = self._apply_enforcement(base_answer) if is_policy_query else base_answer
         return {
-            "answer": base_answer,
+            "answer": processed,
             "policy_analysis": None,
             "confidence": 0.8,
             "requires_human_review": False,
@@ -232,3 +235,20 @@ class PolicyInterpreter:
 {base_answer}
 
 **Next Steps**: Please contact customer service for a detailed review of your specific situation."""
+
+    def _apply_enforcement(self, text: str) -> str:
+        cleaned = re.sub(r"[\r\t]", " ", text or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted email]", cleaned)
+        cleaned = re.sub(r"\b(?:\+?\d[\d\-\s]{7,}\d)\b", "[redacted phone]", cleaned)
+        disclaimer = " Note: This guidance reflects store policy, not legal advice."
+        if not cleaned.endswith(disclaimer):
+            cleaned = f"{cleaned}{disclaimer}"
+        return cleaned
+
+    def _requires_review(self, analysis: Dict, answer_text: str) -> bool:
+        confidence_low = analysis.get("confidence", 0.0) < 0.7
+        unclear = analysis.get("recommendation", {}).get("status") == "unclear"
+        unknown_product = analysis.get("product_type") == "unknown"
+        heuristic_flags = any(w in (answer_text or "").lower() for w in ["unsure", "cannot determine", "unclear"])
+        return confidence_low or unclear or unknown_product or heuristic_flags

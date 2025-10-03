@@ -9,6 +9,9 @@ current_dir = Path(__file__).parent
 app_dir = current_dir.parent.parent
 sys.path.insert(0, str(app_dir))
 
+from app.settings import settings
+settings.feedback_db_path = "/tmp/feedback.db"
+settings.vector_store = "memory"
 from app.main import app
 
 @pytest.fixture(scope="session")

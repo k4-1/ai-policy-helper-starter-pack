@@ -1,4 +1,5 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
+from pydantic import field_validator
 import os
 import re
 
@@ -13,10 +14,19 @@ class Settings(BaseModel):
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "80"))
     data_dir: str = os.getenv("DATA_DIR", "/app/data")
     relevance_threshold: float = float(os.getenv("RELEVANCE_THRESHOLD", "0.35"))
+    mmr_lambda: float = float(os.getenv("MMR_LAMBDA", "0.5"))
+    mmr_candidates: int = int(os.getenv("MMR_CANDIDATES", "12"))
+    cache_enabled: bool = os.getenv("CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+    retrieval_cache_size: int = int(os.getenv("RETRIEVAL_CACHE_SIZE", "128"))
+    generation_cache_size: int = int(os.getenv("GENERATION_CACHE_SIZE", "64"))
+    cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "120"))
+    streaming_enabled: bool = os.getenv("STREAMING_ENABLED", "true").lower() in ("1", "true", "yes")
+    pdpa_redaction_enabled: bool = os.getenv("PDPA_REDACTION_ENABLED", "true").lower() in ("1", "true", "yes")
+    feedback_db_path: str = os.getenv("FEEDBACK_DB_PATH", "/app/app/feedback.db")
 
-    @validator('openai_api_key')
-    def validate_openai_key(cls, v, values):
-        llm_provider = values.get('llm_provider', 'stub')
+    @field_validator('openai_api_key')
+    def validate_openai_key(cls, v, info):
+        llm_provider = info.data.get('llm_provider', 'stub')
         
         if llm_provider == 'openai':
             if not v:
@@ -30,6 +40,22 @@ class Settings(BaseModel):
             if len(v) < 20:
                 raise ValueError("OpenAI API key appears to be too short")
                 
+        return v
+
+    @field_validator('relevance_threshold')
+    def validate_threshold(cls, v):
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return v
+
+    @field_validator('mmr_lambda')
+    def validate_mmr_lambda(cls, v):
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
         return v
     
     def validate_configuration(self):

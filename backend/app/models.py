@@ -28,6 +28,7 @@ class IngestResponse(BaseModel):
 class AskRequest(BaseModel):
     query: str
     k: int | None = 4
+    stream: bool | None = False
 
 class Citation(BaseModel):
     title: str
@@ -49,6 +50,17 @@ class AskResponse(BaseModel):
     citations: List[Citation]
     chunks: List[AggregatedChunk]
     metrics: Dict[str, Any]
+
+class FeedbackRequest(BaseModel):
+    query: str
+    answer: str
+    helpful: bool
+    comment: Optional[str] = None
+    rating: Optional[int] = None
+
+class FeedbackResponse(BaseModel):
+    id: str
+    status: str
 
 class MetricsResponse(BaseModel):
     total_docs: int

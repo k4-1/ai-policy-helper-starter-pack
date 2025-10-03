@@ -24,6 +24,8 @@ services:
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-80}
     volumes:
       - ./data:/app/data:ro
+      - ./backend/app:/app/app:rw
+      - ./backend/pytest.ini:/app/pytest.ini:ro
     ports:
       - "8000:8000"
     depends_on:
